@@ -19,7 +19,8 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
 import { MAX_N, Simulation, type Node } from "./physics";
 
-const TRAIL_LEN = 220;
+const TRAIL_LEN = 1400;
+const TRAIL_FADE_POWER = 0.55;
 const BG_COLOR = 0x05050a;
 
 // ---------- DOM ----------
@@ -268,7 +269,7 @@ function updateTrail(v: NodeVisual, pos: Vector3): void {
 
     // 古いほど背景に溶かす（透明の代替として背景色に lerp）
     const age = i / (hist.length - 1); // 0 = 最古, 1 = 最新
-    const t = Math.pow(age, 1.4);
+    const t = Math.pow(age, TRAIL_FADE_POWER);
     v.trailColors[i * 3 + 0] = bgColor.r + (base.r - bgColor.r) * t;
     v.trailColors[i * 3 + 1] = bgColor.g + (base.g - bgColor.g) * t;
     v.trailColors[i * 3 + 2] = bgColor.b + (base.b - bgColor.b) * t;
