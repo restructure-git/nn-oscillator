@@ -5,11 +5,13 @@ import {
   Color,
   DirectionalLight,
   GridHelper,
+  InterleavedBufferAttribute,
   Line,
   LineBasicMaterial,
   LineSegments,
   Mesh,
   MeshStandardMaterial,
+  Object3D,
   PerspectiveCamera,
   Raycaster,
   Scene,
@@ -19,11 +21,17 @@ import {
   WebGLRenderer,
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { Line2 } from "three/examples/jsm/lines/Line2.js";
+import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 
 import { MAX_N, NPRIME_ID, Simulation, type Node } from "./physics";
 
 const TRAIL_LEN = 1400;
 const TRAIL_FADE_POWER = 0.55;
+const NPRIME_TRAIL_LEN = 3600;
+const NPRIME_FADE_POWER = 0.28;
+const NPRIME_TRAIL_WIDTH = 4.5; // pixels
 const BG_COLOR = 0x05050a;
 
 // ---------- DOM ----------
@@ -101,12 +109,11 @@ const sim = new Simulation(parseInt(nSlider.value, 10));
 // ---------- Visual: nodes ----------
 interface NodeVisual {
   mesh: Mesh<SphereGeometry, MeshStandardMaterial>;
-  trailGeo: BufferGeometry;
-  trailPositions: Float32Array;
-  trailColors: Float32Array;
-  trailLine: Line;
+  trailLine: Object3D;
   baseColor: Color;
   history: Vector3[];
+  flushTrail: () => void;
+  dispose: () => void;
 }
 
 const nodeGroup = scene;
@@ -129,12 +136,11 @@ interface VisualStyle {
   geo: SphereGeometry;
 }
 
-function createVisual(node: Node, style: VisualStyle): NodeVisual {
-  const baseColor = style.baseColor;
+function createSphereMesh(node: Node, style: VisualStyle): Mesh<SphereGeometry, MeshStandardMaterial> {
   const mesh = new Mesh(
     style.geo,
     new MeshStandardMaterial({
-      color: baseColor,
+      color: style.baseColor,
       emissive: style.emissive.clone(),
       emissiveIntensity: style.emissiveIntensity,
       roughness: style.roughness,
@@ -143,6 +149,15 @@ function createVisual(node: Node, style: VisualStyle): NodeVisual {
   );
   mesh.position.copy(node.position);
   mesh.userData.nodeId = node.id;
+  return mesh;
+}
+
+/**
+ * N ノード用: LineBasicMaterial の細い連続線。
+ */
+function createVisual(node: Node, style: VisualStyle): NodeVisual {
+  const baseColor = style.baseColor;
+  const mesh = createSphereMesh(node, style);
   nodeGroup.add(mesh);
 
   const trailPositions = new Float32Array(TRAIL_LEN * 3);
@@ -161,27 +176,125 @@ function createVisual(node: Node, style: VisualStyle): NodeVisual {
   nodeGroup.add(trailLine);
 
   const history: Vector3[] = [];
-  for (let i = 0; i < TRAIL_LEN; i++) {
-    history.push(node.position.clone());
-  }
+  for (let i = 0; i < TRAIL_LEN; i++) history.push(node.position.clone());
 
-  return {
-    mesh,
-    trailGeo,
-    trailPositions,
-    trailColors,
-    trailLine,
-    baseColor,
-    history,
+  const flushTrail = () => {
+    const base = baseColor;
+    for (let i = 0; i < history.length; i++) {
+      const p = history[i];
+      trailPositions[i * 3 + 0] = p.x;
+      trailPositions[i * 3 + 1] = p.y;
+      trailPositions[i * 3 + 2] = p.z;
+      const age = i / (history.length - 1);
+      const t = Math.pow(age, TRAIL_FADE_POWER);
+      trailColors[i * 3 + 0] = bgColor.r + (base.r - bgColor.r) * t;
+      trailColors[i * 3 + 1] = bgColor.g + (base.g - bgColor.g) * t;
+      trailColors[i * 3 + 2] = bgColor.b + (base.b - bgColor.b) * t;
+    }
+    (trailGeo.attributes.position as BufferAttribute).needsUpdate = true;
+    (trailGeo.attributes.color as BufferAttribute).needsUpdate = true;
   };
+
+  const dispose = () => {
+    nodeGroup.remove(mesh);
+    nodeGroup.remove(trailLine);
+    mesh.material.dispose();
+    trailGeo.dispose();
+    trailMat.dispose();
+  };
+
+  return { mesh, trailLine, baseColor, history, flushTrail, dispose };
 }
 
-function disposeVisual(v: NodeVisual): void {
-  nodeGroup.remove(v.mesh);
-  nodeGroup.remove(v.trailLine);
-  v.mesh.material.dispose();
-  v.trailGeo.dispose();
-  (v.trailLine.material as LineBasicMaterial).dispose();
+// N' 用に、線幅を持たせた fat line (Line2) で軌跡を描く
+const nprimeTrailMaterials: LineMaterial[] = [];
+
+function createNPrimeVisual(node: Node, style: VisualStyle): NodeVisual {
+  const baseColor = style.baseColor;
+  const mesh = createSphereMesh(node, style);
+  nodeGroup.add(mesh);
+
+  const history: Vector3[] = [];
+  for (let i = 0; i < NPRIME_TRAIL_LEN; i++) history.push(node.position.clone());
+
+  // 初期化: すべて現在位置で埋めた flat 配列を setPositions/setColors に渡す。
+  // 以後は内部の interleaved buffer を直接書き換えて allocation を避ける。
+  const seedFlat = new Float32Array(NPRIME_TRAIL_LEN * 3);
+  const seedColors = new Float32Array(NPRIME_TRAIL_LEN * 3);
+  for (let i = 0; i < NPRIME_TRAIL_LEN; i++) {
+    seedFlat[i * 3 + 0] = node.position.x;
+    seedFlat[i * 3 + 1] = node.position.y;
+    seedFlat[i * 3 + 2] = node.position.z;
+  }
+
+  const trailGeo = new LineGeometry();
+  trailGeo.setPositions(seedFlat);
+  trailGeo.setColors(seedColors);
+
+  const posBuf = (trailGeo.attributes.instanceStart as InterleavedBufferAttribute)
+    .data.array as Float32Array;
+  const posBufWrap = (trailGeo.attributes.instanceStart as InterleavedBufferAttribute)
+    .data;
+  const colBuf = (
+    trailGeo.attributes.instanceColorStart as InterleavedBufferAttribute
+  ).data.array as Float32Array;
+  const colBufWrap = (
+    trailGeo.attributes.instanceColorStart as InterleavedBufferAttribute
+  ).data;
+
+  const trailMat = new LineMaterial({
+    vertexColors: true,
+    linewidth: NPRIME_TRAIL_WIDTH,
+    worldUnits: false,
+    depthWrite: false,
+  });
+  trailMat.resolution.set(window.innerWidth, window.innerHeight);
+  nprimeTrailMaterials.push(trailMat);
+
+  const trailLine = new Line2(trailGeo, trailMat);
+  trailLine.computeLineDistances();
+  nodeGroup.add(trailLine);
+
+  const flushTrail = () => {
+    const base = baseColor;
+    const segCount = history.length - 1;
+    for (let i = 0; i < segCount; i++) {
+      const a = history[i];
+      const b = history[i + 1];
+      const s = 6 * i;
+      posBuf[s + 0] = a.x;
+      posBuf[s + 1] = a.y;
+      posBuf[s + 2] = a.z;
+      posBuf[s + 3] = b.x;
+      posBuf[s + 4] = b.y;
+      posBuf[s + 5] = b.z;
+
+      const ageA = i / segCount;
+      const ageB = (i + 1) / segCount;
+      const tA = Math.pow(ageA, NPRIME_FADE_POWER);
+      const tB = Math.pow(ageB, NPRIME_FADE_POWER);
+      colBuf[s + 0] = bgColor.r + (base.r - bgColor.r) * tA;
+      colBuf[s + 1] = bgColor.g + (base.g - bgColor.g) * tA;
+      colBuf[s + 2] = bgColor.b + (base.b - bgColor.b) * tA;
+      colBuf[s + 3] = bgColor.r + (base.r - bgColor.r) * tB;
+      colBuf[s + 4] = bgColor.g + (base.g - bgColor.g) * tB;
+      colBuf[s + 5] = bgColor.b + (base.b - bgColor.b) * tB;
+    }
+    posBufWrap.needsUpdate = true;
+    colBufWrap.needsUpdate = true;
+  };
+
+  const dispose = () => {
+    nodeGroup.remove(mesh);
+    nodeGroup.remove(trailLine);
+    mesh.material.dispose();
+    trailGeo.dispose();
+    trailMat.dispose();
+    const idx = nprimeTrailMaterials.indexOf(trailMat);
+    if (idx >= 0) nprimeTrailMaterials.splice(idx, 1);
+  };
+
+  return { mesh, trailLine, baseColor, history, flushTrail, dispose };
 }
 
 function nStyleFor(node: Node): VisualStyle {
@@ -219,25 +332,23 @@ function syncVisualsToSim(): void {
   }
   while (visuals.length > sim.nodes.length) {
     const v = visuals.pop()!;
-    disposeVisual(v);
+    v.dispose();
   }
 }
 
 // N' の visual は 1 つだけ、resize では作り直さない
-const nprimeVisual: NodeVisual = createVisual(sim.nprime, nprimeStyle());
+const nprimeVisual: NodeVisual = createNPrimeVisual(sim.nprime, nprimeStyle());
+
+function fillHistory(v: NodeVisual, p: Vector3): void {
+  for (let j = 0; j < v.history.length; j++) v.history[j].copy(p);
+  v.flushTrail();
+}
 
 function resetTrails(): void {
   for (let i = 0; i < visuals.length; i++) {
-    const v = visuals[i];
-    const p = sim.nodes[i].position;
-    for (let j = 0; j < TRAIL_LEN; j++) {
-      v.history[j].copy(p);
-    }
+    fillHistory(visuals[i], sim.nodes[i].position);
   }
-  const np = sim.nprime.position;
-  for (let j = 0; j < TRAIL_LEN; j++) {
-    nprimeVisual.history[j].copy(np);
-  }
+  fillHistory(nprimeVisual, sim.nprime.position);
 }
 
 // ---------- Coupling lines (selected node view) ----------
@@ -321,6 +432,7 @@ function resize(): void {
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  for (const mat of nprimeTrailMaterials) mat.resolution.set(w, h);
 }
 window.addEventListener("resize", resize);
 resize();
@@ -358,10 +470,8 @@ function applyTrailVisibility(): void {
 toggleNTrailBtn.addEventListener("click", () => {
   showNTrail = !showNTrail;
   if (showNTrail) {
-    // 再表示時は現在位置で塗りつぶして「昔の残像」を出さない
     for (let i = 0; i < visuals.length; i++) {
-      const p = sim.nodes[i].position;
-      for (let j = 0; j < TRAIL_LEN; j++) visuals[i].history[j].copy(p);
+      fillHistory(visuals[i], sim.nodes[i].position);
     }
   }
   applyTrailVisibility();
@@ -370,8 +480,7 @@ toggleNTrailBtn.addEventListener("click", () => {
 toggleNPrimeTrailBtn.addEventListener("click", () => {
   showNPrimeTrail = !showNPrimeTrail;
   if (showNPrimeTrail) {
-    const np = sim.nprime.position;
-    for (let j = 0; j < TRAIL_LEN; j++) nprimeVisual.history[j].copy(np);
+    fillHistory(nprimeVisual, sim.nprime.position);
   }
   applyTrailVisibility();
 });
@@ -386,30 +495,13 @@ speedVal.textContent = speed.toFixed(2);
 // ---------- Update helpers ----------
 function updateTrail(v: NodeVisual, pos: Vector3): void {
   const hist = v.history;
-  // shift: index 0 が最古、末尾が最新
   const oldest = hist[0];
   for (let i = 0; i < hist.length - 1; i++) {
     hist[i] = hist[i + 1];
   }
   oldest.copy(pos);
   hist[hist.length - 1] = oldest;
-
-  const base = v.baseColor;
-  for (let i = 0; i < hist.length; i++) {
-    const p = hist[i];
-    v.trailPositions[i * 3 + 0] = p.x;
-    v.trailPositions[i * 3 + 1] = p.y;
-    v.trailPositions[i * 3 + 2] = p.z;
-
-    // 古いほど背景に溶かす（透明の代替として背景色に lerp）
-    const age = i / (hist.length - 1); // 0 = 最古, 1 = 最新
-    const t = Math.pow(age, TRAIL_FADE_POWER);
-    v.trailColors[i * 3 + 0] = bgColor.r + (base.r - bgColor.r) * t;
-    v.trailColors[i * 3 + 1] = bgColor.g + (base.g - bgColor.g) * t;
-    v.trailColors[i * 3 + 2] = bgColor.b + (base.b - bgColor.b) * t;
-  }
-  (v.trailGeo.attributes.position as BufferAttribute).needsUpdate = true;
-  (v.trailGeo.attributes.color as BufferAttribute).needsUpdate = true;
+  v.flushTrail();
 }
 
 function applyStyleToVisual(
