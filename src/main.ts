@@ -32,6 +32,9 @@ const TRAIL_FADE_POWER = 0.55;
 const NPRIME_TRAIL_LEN = 3600;
 const NPRIME_FADE_POWER = 0.28;
 const NPRIME_TRAIL_WIDTH = 4.5; // pixels
+// 永続蓄積モード用の上限。60fps で約 10 分。
+const NPRIME_PERSIST_MAX_SEGMENTS = 36000;
+const NPRIME_PERSIST_WIDTH = 3.8; // 密度が上がるので少し細めに
 const BG_COLOR = 0x05050a;
 
 // ---------- DOM ----------
@@ -49,10 +52,15 @@ const toggleNTrailBtn = document.querySelector<HTMLButtonElement>(
 const toggleNPrimeTrailBtn = document.querySelector<HTMLButtonElement>(
   "#toggle-nprime-trail"
 )!;
+const togglePersistBtn = document.querySelector<HTMLButtonElement>(
+  "#toggle-persist"
+)!;
 
 // 軌跡表示状態（既定: N オフ / N' オン。N' の軌跡が主役）
 let showNTrail = false;
 let showNPrimeTrail = true;
+// 永続蓄積モード（既定 OFF）
+let persistentMode = false;
 
 // ---------- Renderer / Scene / Camera ----------
 const renderer = new WebGLRenderer({
@@ -339,6 +347,118 @@ function syncVisualsToSim(): void {
 // N' の visual は 1 つだけ、resize では作り直さない
 const nprimeVisual: NodeVisual = createNPrimeVisual(sim.nprime, nprimeStyle());
 
+// ---------- N' persistent trail (蓄積モード) ----------
+// 消えない・フェードしない・毎フレーム 1 セグメントだけ追加。
+interface PersistentTrail {
+  line: Line2;
+  append: (pos: Vector3) => void;
+  reset: (pos: Vector3) => void;
+  setVisible: (v: boolean) => void;
+}
+
+function createPersistentTrail(initPos: Vector3, color: Color): PersistentTrail {
+  const cap = NPRIME_PERSIST_MAX_SEGMENTS;
+  const posArr = new Float32Array(cap * 6);
+  const colArr = new Float32Array(cap * 6);
+  // 全セグメントの色はベースカラー固定（フェードなし）
+  for (let i = 0; i < cap; i++) {
+    const s = 6 * i;
+    colArr[s + 0] = color.r;
+    colArr[s + 1] = color.g;
+    colArr[s + 2] = color.b;
+    colArr[s + 3] = color.r;
+    colArr[s + 4] = color.g;
+    colArr[s + 5] = color.b;
+  }
+  // 初期は全部 initPos に潰しておいて、描画されないよう instanceCount=0
+  for (let i = 0; i < cap; i++) {
+    const s = 6 * i;
+    posArr[s + 0] = initPos.x;
+    posArr[s + 1] = initPos.y;
+    posArr[s + 2] = initPos.z;
+    posArr[s + 3] = initPos.x;
+    posArr[s + 4] = initPos.y;
+    posArr[s + 5] = initPos.z;
+  }
+
+  const geo = new LineGeometry();
+  // LineGeometry.setPositions は内部で配列を確保する。ここでは一度だけ呼んで
+  // 内部の InstancedInterleavedBuffer 構造を作らせ、以降は直接そのバッファに書く。
+  geo.setPositions(new Float32Array(cap * 3));
+  geo.setColors(new Float32Array(cap * 3));
+  const posAttr = geo.attributes.instanceStart as InterleavedBufferAttribute;
+  const colAttr = geo.attributes.instanceColorStart as InterleavedBufferAttribute;
+  const posBufWrap = posAttr.data;
+  const posBuf = posBufWrap.array as Float32Array;
+  posBuf.set(posArr);
+  (colAttr.data.array as Float32Array).set(colArr);
+  posBufWrap.needsUpdate = true;
+  colAttr.data.needsUpdate = true;
+
+  const mat = new LineMaterial({
+    vertexColors: true,
+    linewidth: NPRIME_PERSIST_WIDTH,
+    worldUnits: false,
+    depthWrite: false,
+  });
+  mat.resolution.set(window.innerWidth, window.innerHeight);
+  nprimeTrailMaterials.push(mat);
+
+  const line = new Line2(geo, mat);
+  line.computeLineDistances();
+  scene.add(line);
+  geo.instanceCount = 0;
+
+  const prev = initPos.clone();
+  let hasPrev = false;
+  let segCount = 0;
+
+  const append = (pos: Vector3) => {
+    if (!hasPrev) {
+      prev.copy(pos);
+      hasPrev = true;
+      return;
+    }
+    if (segCount >= cap) return; // 上限で凍結
+    // 前回とほぼ同じ位置なら省略（同じ点連続の無駄書き込みを減らす）
+    const dx = pos.x - prev.x;
+    const dy = pos.y - prev.y;
+    const dz = pos.z - prev.z;
+    if (dx * dx + dy * dy + dz * dz < 1e-8) return;
+    const s = 6 * segCount;
+    posBuf[s + 0] = prev.x;
+    posBuf[s + 1] = prev.y;
+    posBuf[s + 2] = prev.z;
+    posBuf[s + 3] = pos.x;
+    posBuf[s + 4] = pos.y;
+    posBuf[s + 5] = pos.z;
+    // 色は初期化済みなので touch 不要
+    prev.copy(pos);
+    segCount++;
+    geo.instanceCount = segCount;
+    posBufWrap.needsUpdate = true;
+  };
+
+  const reset = (pos: Vector3) => {
+    segCount = 0;
+    hasPrev = false;
+    prev.copy(pos);
+    geo.instanceCount = 0;
+  };
+
+  const setVisible = (v: boolean) => {
+    line.visible = v;
+  };
+
+  return { line, append, reset, setVisible };
+}
+
+const nprimePersistent: PersistentTrail = createPersistentTrail(
+  sim.nprime.position,
+  NPRIME_BASE
+);
+nprimePersistent.setVisible(false);
+
 function fillHistory(v: NodeVisual, p: Vector3): void {
   for (let j = 0; j < v.history.length; j++) v.history[j].copy(p);
   v.flushTrail();
@@ -349,6 +469,7 @@ function resetTrails(): void {
     fillHistory(visuals[i], sim.nodes[i].position);
   }
   fillHistory(nprimeVisual, sim.nprime.position);
+  nprimePersistent.reset(sim.nprime.position);
 }
 
 // ---------- Coupling lines (selected node view) ----------
@@ -462,9 +583,14 @@ resetBtn.addEventListener("click", resetTrails);
 
 function applyTrailVisibility(): void {
   for (const v of visuals) v.trailLine.visible = showNTrail;
-  nprimeVisual.trailLine.visible = showNPrimeTrail;
+  // rolling は N' 軌跡 ON かつ蓄積 OFF のときだけ表示
+  nprimeVisual.trailLine.visible = showNPrimeTrail && !persistentMode;
+  // persistent は N' 軌跡 ON かつ蓄積 ON のときだけ表示
+  nprimePersistent.setVisible(showNPrimeTrail && persistentMode);
+
   toggleNTrailBtn.classList.toggle("on", showNTrail);
   toggleNPrimeTrailBtn.classList.toggle("on", showNPrimeTrail);
+  togglePersistBtn.classList.toggle("on", persistentMode);
 }
 
 toggleNTrailBtn.addEventListener("click", () => {
@@ -480,8 +606,20 @@ toggleNTrailBtn.addEventListener("click", () => {
 toggleNPrimeTrailBtn.addEventListener("click", () => {
   showNPrimeTrail = !showNPrimeTrail;
   if (showNPrimeTrail) {
-    fillHistory(nprimeVisual, sim.nprime.position);
+    if (persistentMode) {
+      nprimePersistent.reset(sim.nprime.position);
+    } else {
+      fillHistory(nprimeVisual, sim.nprime.position);
+    }
   }
+  applyTrailVisibility();
+});
+
+togglePersistBtn.addEventListener("click", () => {
+  persistentMode = !persistentMode;
+  // モード切替時は両方 fresh に。切替の瞬間からその軌跡がゼロから溜まる。
+  nprimePersistent.reset(sim.nprime.position);
+  fillHistory(nprimeVisual, sim.nprime.position);
   applyTrailVisibility();
 });
 
@@ -639,7 +777,13 @@ function frame(): void {
   }
   const np = sim.nprime.position;
   nprimeVisual.mesh.position.copy(np);
-  if (showNPrimeTrail) updateTrail(nprimeVisual, np);
+  if (showNPrimeTrail) {
+    if (persistentMode) {
+      nprimePersistent.append(np);
+    } else {
+      updateTrail(nprimeVisual, np);
+    }
+  }
   updateSelectionVisuals();
 
   controls.update();

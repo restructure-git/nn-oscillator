@@ -182,3 +182,8 @@ input[type="range"]::-moz-range-thumb {
 .toggle:active {
   background: rgba(232, 232, 240, 0.1);
 }
+
+.toggle.wide {
+  width: 100%;
+  margin-top: 2px;
+}
