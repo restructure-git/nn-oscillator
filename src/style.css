@@ -151,3 +151,34 @@ input[type="range"]::-moz-range-thumb {
 #reset-btn:active {
   background: rgba(232, 232, 240, 0.15);
 }
+
+.toggle-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.toggle {
+  flex: 1;
+  height: 44px;
+  border-radius: 22px;
+  border: 1px solid rgba(232, 232, 240, 0.2);
+  background: transparent;
+  color: rgba(232, 232, 240, 0.55);
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.toggle.on {
+  background: rgba(180, 200, 255, 0.16);
+  color: rgba(240, 240, 250, 0.95);
+  border-color: rgba(180, 200, 255, 0.55);
+  box-shadow: 0 0 12px rgba(180, 200, 255, 0.15);
+}
+
+.toggle:active {
+  background: rgba(232, 232, 240, 0.1);
+}

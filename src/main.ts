@@ -35,6 +35,16 @@ const kVal = document.querySelector<HTMLSpanElement>("#k-val")!;
 const nVal = document.querySelector<HTMLSpanElement>("#n-val")!;
 const speedVal = document.querySelector<HTMLSpanElement>("#speed-val")!;
 const resetBtn = document.querySelector<HTMLButtonElement>("#reset-btn")!;
+const toggleNTrailBtn = document.querySelector<HTMLButtonElement>(
+  "#toggle-n-trail"
+)!;
+const toggleNPrimeTrailBtn = document.querySelector<HTMLButtonElement>(
+  "#toggle-nprime-trail"
+)!;
+
+// 軌跡表示状態（既定: N オフ / N' オン。N' の軌跡が主役）
+let showNTrail = false;
+let showNPrimeTrail = true;
 
 // ---------- Renderer / Scene / Camera ----------
 const renderer = new WebGLRenderer({
@@ -203,7 +213,9 @@ function nprimeStyle(): VisualStyle {
 function syncVisualsToSim(): void {
   while (visuals.length < sim.nodes.length) {
     const node = sim.nodes[visuals.length];
-    visuals.push(createVisual(node, nStyleFor(node)));
+    const v = createVisual(node, nStyleFor(node));
+    v.trailLine.visible = showNTrail;
+    visuals.push(v);
   }
   while (visuals.length > sim.nodes.length) {
     const v = visuals.pop()!;
@@ -336,8 +348,37 @@ nSlider.addEventListener("input", () => {
 });
 resetBtn.addEventListener("click", resetTrails);
 
+function applyTrailVisibility(): void {
+  for (const v of visuals) v.trailLine.visible = showNTrail;
+  nprimeVisual.trailLine.visible = showNPrimeTrail;
+  toggleNTrailBtn.classList.toggle("on", showNTrail);
+  toggleNPrimeTrailBtn.classList.toggle("on", showNPrimeTrail);
+}
+
+toggleNTrailBtn.addEventListener("click", () => {
+  showNTrail = !showNTrail;
+  if (showNTrail) {
+    // 再表示時は現在位置で塗りつぶして「昔の残像」を出さない
+    for (let i = 0; i < visuals.length; i++) {
+      const p = sim.nodes[i].position;
+      for (let j = 0; j < TRAIL_LEN; j++) visuals[i].history[j].copy(p);
+    }
+  }
+  applyTrailVisibility();
+});
+
+toggleNPrimeTrailBtn.addEventListener("click", () => {
+  showNPrimeTrail = !showNPrimeTrail;
+  if (showNPrimeTrail) {
+    const np = sim.nprime.position;
+    for (let j = 0; j < TRAIL_LEN; j++) nprimeVisual.history[j].copy(np);
+  }
+  applyTrailVisibility();
+});
+
 // ---------- Initial sync ----------
 syncVisualsToSim();
+applyTrailVisibility();
 kVal.textContent = coupling.toFixed(2);
 nVal.textContent = String(sim.nodes.length);
 speedVal.textContent = speed.toFixed(2);
@@ -502,11 +543,11 @@ function frame(): void {
   for (let i = 0; i < visuals.length; i++) {
     const p = sim.nodes[i].position;
     visuals[i].mesh.position.copy(p);
-    updateTrail(visuals[i], p);
+    if (showNTrail) updateTrail(visuals[i], p);
   }
   const np = sim.nprime.position;
   nprimeVisual.mesh.position.copy(np);
-  updateTrail(nprimeVisual, np);
+  if (showNPrimeTrail) updateTrail(nprimeVisual, np);
   updateSelectionVisuals();
 
   controls.update();
