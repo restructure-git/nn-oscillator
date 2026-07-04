@@ -358,42 +358,38 @@ interface PersistentTrail {
 
 function createPersistentTrail(initPos: Vector3, color: Color): PersistentTrail {
   const cap = NPRIME_PERSIST_MAX_SEGMENTS;
-  const posArr = new Float32Array(cap * 6);
-  const colArr = new Float32Array(cap * 6);
-  // 全セグメントの色はベースカラー固定（フェードなし）
-  for (let i = 0; i < cap; i++) {
-    const s = 6 * i;
-    colArr[s + 0] = color.r;
-    colArr[s + 1] = color.g;
-    colArr[s + 2] = color.b;
-    colArr[s + 3] = color.r;
-    colArr[s + 4] = color.g;
-    colArr[s + 5] = color.b;
-  }
-  // 初期は全部 initPos に潰しておいて、描画されないよう instanceCount=0
-  for (let i = 0; i < cap; i++) {
-    const s = 6 * i;
-    posArr[s + 0] = initPos.x;
-    posArr[s + 1] = initPos.y;
-    posArr[s + 2] = initPos.z;
-    posArr[s + 3] = initPos.x;
-    posArr[s + 4] = initPos.y;
-    posArr[s + 5] = initPos.z;
-  }
 
+  // LineGeometry.setPositions は入力を「点数」とみなし、内部の InstancedInterleavedBuffer
+  // として 6*(点数-1) 個の float を確保する。cap 個のセグメントを収めたいので
+  // 入力配列長は 3*(cap+1) を渡す。
   const geo = new LineGeometry();
-  // LineGeometry.setPositions は内部で配列を確保する。ここでは一度だけ呼んで
-  // 内部の InstancedInterleavedBuffer 構造を作らせ、以降は直接そのバッファに書く。
-  geo.setPositions(new Float32Array(cap * 3));
-  geo.setColors(new Float32Array(cap * 3));
+  geo.setPositions(new Float32Array(3 * (cap + 1)));
+  geo.setColors(new Float32Array(3 * (cap + 1)));
   const posAttr = geo.attributes.instanceStart as InterleavedBufferAttribute;
   const colAttr = geo.attributes.instanceColorStart as InterleavedBufferAttribute;
   const posBufWrap = posAttr.data;
+  const colBufWrap = colAttr.data;
   const posBuf = posBufWrap.array as Float32Array;
-  posBuf.set(posArr);
-  (colAttr.data.array as Float32Array).set(colArr);
+  const colBuf = colBufWrap.array as Float32Array;
+
+  // 全セグメントを初期位置に潰し、色はベースカラーで固定塗り（フェードなし）
+  for (let i = 0; i < cap; i++) {
+    const s = 6 * i;
+    posBuf[s + 0] = initPos.x;
+    posBuf[s + 1] = initPos.y;
+    posBuf[s + 2] = initPos.z;
+    posBuf[s + 3] = initPos.x;
+    posBuf[s + 4] = initPos.y;
+    posBuf[s + 5] = initPos.z;
+    colBuf[s + 0] = color.r;
+    colBuf[s + 1] = color.g;
+    colBuf[s + 2] = color.b;
+    colBuf[s + 3] = color.r;
+    colBuf[s + 4] = color.g;
+    colBuf[s + 5] = color.b;
+  }
   posBufWrap.needsUpdate = true;
-  colAttr.data.needsUpdate = true;
+  colBufWrap.needsUpdate = true;
 
   const mat = new LineMaterial({
     vertexColors: true,
