@@ -40,8 +40,10 @@ const NPRIME_TRAIL_WIDTH = 4.5; // pixels
 // 永続蓄積モード: 経路そのものではなく、通過範囲を包む凸包（輪郭）だけを残す。
 const NPRIME_HULL_REBUILD_EVERY = 8; // 新規点がこの数溜まるたびに凸包を再計算
 const NPRIME_HULL_DEDUP_DIST2 = 1e-8; // ほぼ同一点の重複追加を避ける
-const NPRIME_HULL_FILL_OPACITY = 0.07; // 奥行きを見せるための薄い塗り
-const NPRIME_HULL_EDGE_OPACITY = 0.75; // 輪郭線本体
+const NPRIME_HULL_FILL_OPACITY = 0.16; // 奥行きを見せるための塗り
+const NPRIME_HULL_EDGE_OPACITY = 0.9; // 輪郭線本体
+// N' 自身は銀色だが、輪郭は「観測者が漂う領域」として別の差し色にする
+const NPRIME_HULL_COLOR = new Color(0x7ce0ff);
 const BG_COLOR = 0x05050a;
 
 // ---------- DOM ----------
@@ -465,7 +467,7 @@ function createPersistentTrail(initPos: Vector3, color: Color): PersistentTrail 
 
 const nprimePersistent: PersistentTrail = createPersistentTrail(
   sim.nprime.position,
-  NPRIME_BASE
+  NPRIME_HULL_COLOR
 );
 nprimePersistent.setVisible(false);
 
