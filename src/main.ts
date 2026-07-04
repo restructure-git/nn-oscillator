@@ -20,7 +20,7 @@ import {
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-import { MAX_N, Simulation, type Node } from "./physics";
+import { MAX_N, NPRIME_ID, Simulation, type Node } from "./physics";
 
 const TRAIL_LEN = 1400;
 const TRAIL_FADE_POWER = 0.55;
@@ -103,22 +103,32 @@ const nodeGroup = scene;
 const visuals: NodeVisual[] = [];
 
 const sharedSphereGeo = new SphereGeometry(0.13, 24, 16);
+const nprimeSphereGeo = new SphereGeometry(0.22, 32, 20);
 const bgColor = new Color(BG_COLOR);
 
 function hueToColor(h: number): Color {
   return new Color().setHSL(h, 0.65, 0.62);
 }
 
-function createVisual(node: Node): NodeVisual {
-  const baseColor = hueToColor(node.hue);
+interface VisualStyle {
+  baseColor: Color;
+  emissive: Color;
+  emissiveIntensity: number;
+  roughness: number;
+  metalness: number;
+  geo: SphereGeometry;
+}
+
+function createVisual(node: Node, style: VisualStyle): NodeVisual {
+  const baseColor = style.baseColor;
   const mesh = new Mesh(
-    sharedSphereGeo,
+    style.geo,
     new MeshStandardMaterial({
       color: baseColor,
-      emissive: baseColor.clone(),
-      emissiveIntensity: 0.35,
-      roughness: 0.45,
-      metalness: 0.15,
+      emissive: style.emissive.clone(),
+      emissiveIntensity: style.emissiveIntensity,
+      roughness: style.roughness,
+      metalness: style.metalness,
     })
   );
   mesh.position.copy(node.position);
@@ -164,15 +174,45 @@ function disposeVisual(v: NodeVisual): void {
   (v.trailLine.material as LineBasicMaterial).dispose();
 }
 
+function nStyleFor(node: Node): VisualStyle {
+  const c = hueToColor(node.hue);
+  return {
+    baseColor: c,
+    emissive: c,
+    emissiveIntensity: 0.35,
+    roughness: 0.45,
+    metalness: 0.15,
+    geo: sharedSphereGeo,
+  };
+}
+
+const NPRIME_BASE = new Color(0xdde3ff);
+const NPRIME_EMISSIVE = new Color(0x6a7ab8);
+
+function nprimeStyle(): VisualStyle {
+  return {
+    baseColor: NPRIME_BASE.clone(),
+    emissive: NPRIME_EMISSIVE,
+    emissiveIntensity: 0.55,
+    roughness: 0.22,
+    metalness: 0.7,
+    geo: nprimeSphereGeo,
+  };
+}
+
 function syncVisualsToSim(): void {
   while (visuals.length < sim.nodes.length) {
-    visuals.push(createVisual(sim.nodes[visuals.length]));
+    const node = sim.nodes[visuals.length];
+    visuals.push(createVisual(node, nStyleFor(node)));
   }
   while (visuals.length > sim.nodes.length) {
     const v = visuals.pop()!;
     disposeVisual(v);
   }
 }
+
+// N' の visual は 1 つだけ、resize では作り直さない
+const nprimeVisual: NodeVisual = createVisual(sim.nprime, nprimeStyle());
 
 function resetTrails(): void {
   for (let i = 0; i < visuals.length; i++) {
@@ -182,20 +222,38 @@ function resetTrails(): void {
       v.history[j].copy(p);
     }
   }
+  const np = sim.nprime.position;
+  for (let j = 0; j < TRAIL_LEN; j++) {
+    nprimeVisual.history[j].copy(np);
+  }
 }
 
 // ---------- Coupling lines (selected node view) ----------
+// 選択された点から、他の全ノード(N + N')へ引く線
 const couplingGeo = new BufferGeometry();
-const couplingPositions = new Float32Array(MAX_N * 2 * 3);
+const couplingPositions = new Float32Array((MAX_N + 1) * 2 * 3);
 couplingGeo.setAttribute("position", new BufferAttribute(couplingPositions, 3));
 const couplingMat = new LineBasicMaterial({
   color: 0xffffff,
   transparent: true,
-  opacity: 0.35,
+  opacity: 0.4,
 });
 const couplingLines = new LineSegments(couplingGeo, couplingMat);
 couplingLines.visible = false;
 scene.add(couplingLines);
+
+// ---------- Persistent N' ↔ N links ----------
+// N' は常時 N 全部と繋がっている（薄い線で表示）
+const linkGeo = new BufferGeometry();
+const linkPositions = new Float32Array(MAX_N * 2 * 3);
+linkGeo.setAttribute("position", new BufferAttribute(linkPositions, 3));
+const linkMat = new LineBasicMaterial({
+  color: 0xb0c4ff,
+  transparent: true,
+  opacity: 0.22,
+});
+const linkLines = new LineSegments(linkGeo, linkMat);
+scene.add(linkLines);
 
 // ---------- Selection ----------
 let selectedId: number | null = null;
@@ -229,10 +287,9 @@ canvas.addEventListener("pointerup", (e) => {
   pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   pointerNdc.y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
   raycaster.setFromCamera(pointerNdc, camera);
-  const hits = raycaster.intersectObjects(
-    visuals.map((v) => v.mesh),
-    false
-  );
+  const meshes = visuals.map((v) => v.mesh);
+  meshes.push(nprimeVisual.mesh);
+  const hits = raycaster.intersectObjects(meshes, false);
   if (hits.length > 0) {
     const nodeId = hits[0].object.userData.nodeId as number;
     if (selectedId === nodeId) {
@@ -314,52 +371,112 @@ function updateTrail(v: NodeVisual, pos: Vector3): void {
   (v.trailGeo.attributes.color as BufferAttribute).needsUpdate = true;
 }
 
+function applyStyleToVisual(
+  v: NodeVisual,
+  isSel: boolean,
+  isOther: boolean,
+  baseIntensity: number,
+  selIntensity: number,
+  dimIntensity: number
+): void {
+  const mat = v.mesh.material;
+  if (isSel) {
+    mat.color.copy(v.baseColor).multiplyScalar(1.2);
+    mat.emissive.copy(v.baseColor);
+    mat.emissiveIntensity = selIntensity;
+    v.mesh.scale.setScalar(1.6);
+  } else if (isOther) {
+    mat.color.copy(v.baseColor).multiplyScalar(0.55);
+    mat.emissive.copy(v.baseColor);
+    mat.emissiveIntensity = dimIntensity;
+    v.mesh.scale.setScalar(1.0);
+  } else {
+    mat.color.copy(v.baseColor);
+    mat.emissive.copy(v.baseColor);
+    mat.emissiveIntensity = baseIntensity;
+    v.mesh.scale.setScalar(1.0);
+  }
+}
+
 function updateSelectionVisuals(): void {
+  const nprimeSelected = selectedId === NPRIME_ID;
+
   for (let i = 0; i < visuals.length; i++) {
     const v = visuals[i];
     const isSel = selectedId === sim.nodes[i].id;
     const isOther = selectedId !== null && !isSel;
-    const scale = isSel ? 1.8 : 1.0;
-    v.mesh.scale.setScalar(scale);
-    const mat = v.mesh.material;
-    if (isSel) {
-      mat.color.copy(v.baseColor).multiplyScalar(1.2);
-      mat.emissive.copy(v.baseColor);
-      mat.emissiveIntensity = 0.7;
-    } else if (isOther) {
-      mat.color.copy(v.baseColor).multiplyScalar(0.55);
-      mat.emissive.copy(v.baseColor);
-      mat.emissiveIntensity = 0.15;
-    } else {
-      mat.color.copy(v.baseColor);
-      mat.emissive.copy(v.baseColor);
-      mat.emissiveIntensity = 0.35;
-    }
+    applyStyleToVisual(v, isSel, isOther, 0.35, 0.75, 0.15);
   }
 
-  if (selectedId !== null) {
+  // N' 自身は「選択時は光る／N が選ばれた時は少しだけ暗く」
+  applyStyleToVisual(
+    nprimeVisual,
+    nprimeSelected,
+    selectedId !== null && !nprimeSelected,
+    0.55,
+    1.0,
+    0.3
+  );
+  // N' は元々大きいので選択時のスケールを整える
+  nprimeVisual.mesh.scale.setScalar(nprimeSelected ? 1.35 : 1.0);
+
+  // 常時表示の N' ↔ N リンク
+  const np = sim.nprime.position;
+  let lptr = 0;
+  for (let i = 0; i < sim.nodes.length; i++) {
+    const p = sim.nodes[i].position;
+    linkPositions[lptr++] = np.x;
+    linkPositions[lptr++] = np.y;
+    linkPositions[lptr++] = np.z;
+    linkPositions[lptr++] = p.x;
+    linkPositions[lptr++] = p.y;
+    linkPositions[lptr++] = p.z;
+  }
+  for (; lptr < linkPositions.length; lptr++) linkPositions[lptr] = 0;
+  linkGeo.setDrawRange(0, sim.nodes.length * 2);
+  (linkGeo.attributes.position as BufferAttribute).needsUpdate = true;
+  // N' 選択時は N' 側リンクを一段明るく
+  linkMat.opacity = nprimeSelected ? 0.55 : 0.22;
+
+  // 選択された時のみ表示される coupling line
+  if (selectedId === null) {
+    couplingLines.visible = false;
+    return;
+  }
+  couplingLines.visible = true;
+
+  // 選択された点の位置と、その相手側の点のリスト
+  let selPos: Vector3;
+  let others: Vector3[];
+  if (nprimeSelected) {
+    selPos = np;
+    others = sim.nodes.map((n) => n.position);
+  } else {
     const selIdx = sim.nodes.findIndex((n) => n.id === selectedId);
     if (selIdx < 0) {
       couplingLines.visible = false;
       return;
     }
-    const sp = sim.nodes[selIdx].position;
-    let ptr = 0;
+    selPos = sim.nodes[selIdx].position;
+    others = [];
     for (let j = 0; j < sim.nodes.length; j++) {
-      if (j === selIdx) continue;
-      const op = sim.nodes[j].position;
-      couplingPositions[ptr++] = sp.x;
-      couplingPositions[ptr++] = sp.y;
-      couplingPositions[ptr++] = sp.z;
-      couplingPositions[ptr++] = op.x;
-      couplingPositions[ptr++] = op.y;
-      couplingPositions[ptr++] = op.z;
+      if (j !== selIdx) others.push(sim.nodes[j].position);
     }
-    // 使わない頂点は同一点にして描画されないように
-    for (; ptr < couplingPositions.length; ptr++) couplingPositions[ptr] = 0;
-    couplingGeo.setDrawRange(0, (sim.nodes.length - 1) * 2);
-    (couplingGeo.attributes.position as BufferAttribute).needsUpdate = true;
+    others.push(np); // 選択された N は N' とも繋がっている
   }
+
+  let ptr = 0;
+  for (const op of others) {
+    couplingPositions[ptr++] = selPos.x;
+    couplingPositions[ptr++] = selPos.y;
+    couplingPositions[ptr++] = selPos.z;
+    couplingPositions[ptr++] = op.x;
+    couplingPositions[ptr++] = op.y;
+    couplingPositions[ptr++] = op.z;
+  }
+  for (; ptr < couplingPositions.length; ptr++) couplingPositions[ptr] = 0;
+  couplingGeo.setDrawRange(0, others.length * 2);
+  (couplingGeo.attributes.position as BufferAttribute).needsUpdate = true;
 }
 
 // ---------- Loop ----------
@@ -387,6 +504,9 @@ function frame(): void {
     visuals[i].mesh.position.copy(p);
     updateTrail(visuals[i], p);
   }
+  const np = sim.nprime.position;
+  nprimeVisual.mesh.position.copy(np);
+  updateTrail(nprimeVisual, np);
   updateSelectionVisuals();
 
   controls.update();
