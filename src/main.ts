@@ -1,12 +1,15 @@
 import {
+  AmbientLight,
   BufferAttribute,
   BufferGeometry,
   Color,
+  DirectionalLight,
+  GridHelper,
   Line,
   LineBasicMaterial,
   LineSegments,
   Mesh,
-  MeshBasicMaterial,
+  MeshStandardMaterial,
   PerspectiveCamera,
   Raycaster,
   Scene,
@@ -54,13 +57,40 @@ controls.minDistance = 3;
 controls.maxDistance = 18;
 controls.enablePan = false;
 controls.rotateSpeed = 0.7;
+controls.autoRotate = false;
+controls.touches = {
+  ONE: 0, // ROTATE
+  TWO: 2, // DOLLY_PAN → ピンチズーム
+};
+
+// ---------- Lighting (spheres の 3D 陰影用) ----------
+scene.add(new AmbientLight(0xffffff, 0.35));
+
+const keyLight = new DirectionalLight(0xffffff, 1.0);
+keyLight.position.set(6, 8, 5);
+scene.add(keyLight);
+
+const fillLight = new DirectionalLight(0x8fa8ff, 0.35);
+fillLight.position.set(-4, -2, 3);
+scene.add(fillLight);
+
+const rimLight = new DirectionalLight(0xff9fbf, 0.25);
+rimLight.position.set(0, -4, -6);
+scene.add(rimLight);
+
+// ---------- 空間参照（薄いグリッドで奥行きを見せる）----------
+const grid = new GridHelper(8, 8, 0x2a2a45, 0x1a1a2a);
+grid.position.y = -3.2;
+(grid.material as LineBasicMaterial).transparent = true;
+(grid.material as LineBasicMaterial).opacity = 0.35;
+scene.add(grid);
 
 // ---------- Simulation ----------
 const sim = new Simulation(parseInt(nSlider.value, 10));
 
 // ---------- Visual: nodes ----------
 interface NodeVisual {
-  mesh: Mesh<SphereGeometry, MeshBasicMaterial>;
+  mesh: Mesh<SphereGeometry, MeshStandardMaterial>;
   trailGeo: BufferGeometry;
   trailPositions: Float32Array;
   trailColors: Float32Array;
@@ -83,7 +113,13 @@ function createVisual(node: Node): NodeVisual {
   const baseColor = hueToColor(node.hue);
   const mesh = new Mesh(
     sharedSphereGeo,
-    new MeshBasicMaterial({ color: baseColor })
+    new MeshStandardMaterial({
+      color: baseColor,
+      emissive: baseColor.clone(),
+      emissiveIntensity: 0.35,
+      roughness: 0.45,
+      metalness: 0.15,
+    })
   );
   mesh.position.copy(node.position);
   mesh.userData.nodeId = node.id;
@@ -288,10 +324,16 @@ function updateSelectionVisuals(): void {
     const mat = v.mesh.material;
     if (isSel) {
       mat.color.copy(v.baseColor).multiplyScalar(1.2);
+      mat.emissive.copy(v.baseColor);
+      mat.emissiveIntensity = 0.7;
     } else if (isOther) {
       mat.color.copy(v.baseColor).multiplyScalar(0.55);
+      mat.emissive.copy(v.baseColor);
+      mat.emissiveIntensity = 0.15;
     } else {
       mat.color.copy(v.baseColor);
+      mat.emissive.copy(v.baseColor);
+      mat.emissiveIntensity = 0.35;
     }
   }
 
