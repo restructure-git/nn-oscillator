@@ -4,12 +4,16 @@ import {
   BufferGeometry,
   Color,
   DirectionalLight,
+  DoubleSide,
+  EdgesGeometry,
   GridHelper,
+  Group,
   InterleavedBufferAttribute,
   Line,
   LineBasicMaterial,
   LineSegments,
   Mesh,
+  MeshBasicMaterial,
   MeshStandardMaterial,
   Object3D,
   PerspectiveCamera,
@@ -21,6 +25,7 @@ import {
   WebGLRenderer,
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { ConvexGeometry } from "three/examples/jsm/geometries/ConvexGeometry.js";
 import { Line2 } from "three/examples/jsm/lines/Line2.js";
 import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
@@ -32,9 +37,11 @@ const TRAIL_FADE_POWER = 0.55;
 const NPRIME_TRAIL_LEN = 3600;
 const NPRIME_FADE_POWER = 0.28;
 const NPRIME_TRAIL_WIDTH = 4.5; // pixels
-// 永続蓄積モード用の上限。60fps で約 10 分。
-const NPRIME_PERSIST_MAX_SEGMENTS = 36000;
-const NPRIME_PERSIST_WIDTH = 3.8; // 密度が上がるので少し細めに
+// 永続蓄積モード: 経路そのものではなく、通過範囲を包む凸包（輪郭）だけを残す。
+const NPRIME_HULL_REBUILD_EVERY = 8; // 新規点がこの数溜まるたびに凸包を再計算
+const NPRIME_HULL_DEDUP_DIST2 = 1e-8; // ほぼ同一点の重複追加を避ける
+const NPRIME_HULL_FILL_OPACITY = 0.07; // 奥行きを見せるための薄い塗り
+const NPRIME_HULL_EDGE_OPACITY = 0.75; // 輪郭線本体
 const BG_COLOR = 0x05050a;
 
 // ---------- DOM ----------
@@ -348,66 +355,83 @@ function syncVisualsToSim(): void {
 const nprimeVisual: NodeVisual = createNPrimeVisual(sim.nprime, nprimeStyle());
 
 // ---------- N' persistent trail (蓄積モード) ----------
-// 消えない・フェードしない・毎フレーム 1 セグメントだけ追加。
+// 経路そのものは残さず、通過範囲を包む 3D 凸包（輪郭）だけを蓄積する。
+// 凸包の頂点だけを次回計算の起点として持ち回るため、点群は無限には増えない。
 interface PersistentTrail {
-  line: Line2;
+  root: Object3D;
   append: (pos: Vector3) => void;
   reset: (pos: Vector3) => void;
   setVisible: (v: boolean) => void;
 }
 
-function createPersistentTrail(initPos: Vector3, color: Color): PersistentTrail {
-  const cap = NPRIME_PERSIST_MAX_SEGMENTS;
-
-  // LineGeometry.setPositions は入力を「点数」とみなし、内部の InstancedInterleavedBuffer
-  // として 6*(点数-1) 個の float を確保する。cap 個のセグメントを収めたいので
-  // 入力配列長は 3*(cap+1) を渡す。
-  const geo = new LineGeometry();
-  geo.setPositions(new Float32Array(3 * (cap + 1)));
-  geo.setColors(new Float32Array(3 * (cap + 1)));
-  const posAttr = geo.attributes.instanceStart as InterleavedBufferAttribute;
-  const colAttr = geo.attributes.instanceColorStart as InterleavedBufferAttribute;
-  const posBufWrap = posAttr.data;
-  const colBufWrap = colAttr.data;
-  const posBuf = posBufWrap.array as Float32Array;
-  const colBuf = colBufWrap.array as Float32Array;
-
-  // 全セグメントを初期位置に潰し、色はベースカラーで固定塗り（フェードなし）
-  for (let i = 0; i < cap; i++) {
-    const s = 6 * i;
-    posBuf[s + 0] = initPos.x;
-    posBuf[s + 1] = initPos.y;
-    posBuf[s + 2] = initPos.z;
-    posBuf[s + 3] = initPos.x;
-    posBuf[s + 4] = initPos.y;
-    posBuf[s + 5] = initPos.z;
-    colBuf[s + 0] = color.r;
-    colBuf[s + 1] = color.g;
-    colBuf[s + 2] = color.b;
-    colBuf[s + 3] = color.r;
-    colBuf[s + 4] = color.g;
-    colBuf[s + 5] = color.b;
+function extractHullVertices(geo: BufferGeometry): Vector3[] {
+  const posAttr = geo.attributes.position as BufferAttribute;
+  const seen = new Map<string, Vector3>();
+  const v = new Vector3();
+  for (let i = 0; i < posAttr.count; i++) {
+    v.fromBufferAttribute(posAttr, i);
+    const key = `${v.x.toFixed(4)}|${v.y.toFixed(4)}|${v.z.toFixed(4)}`;
+    if (!seen.has(key)) seen.set(key, v.clone());
   }
-  posBufWrap.needsUpdate = true;
-  colBufWrap.needsUpdate = true;
+  return Array.from(seen.values());
+}
 
-  const mat = new LineMaterial({
-    vertexColors: true,
-    linewidth: NPRIME_PERSIST_WIDTH,
-    worldUnits: false,
+function createPersistentTrail(initPos: Vector3, color: Color): PersistentTrail {
+  const group = new Group();
+  scene.add(group);
+
+  const fillMat = new MeshBasicMaterial({
+    color,
+    transparent: true,
+    opacity: NPRIME_HULL_FILL_OPACITY,
+    side: DoubleSide,
     depthWrite: false,
   });
-  mat.resolution.set(window.innerWidth, window.innerHeight);
-  nprimeTrailMaterials.push(mat);
+  const edgeMat = new LineBasicMaterial({
+    color,
+    transparent: true,
+    opacity: NPRIME_HULL_EDGE_OPACITY,
+  });
 
-  const line = new Line2(geo, mat);
-  line.computeLineDistances();
-  scene.add(line);
-  geo.instanceCount = 0;
-
+  let hullMesh: Mesh | null = null;
+  let hullEdges: LineSegments | null = null;
+  // 直近で確定した凸包の頂点（次回再計算の起点。全履歴は保持しない）
+  let hullVerts: Vector3[] = [];
+  let pending: Vector3[] = [];
   const prev = initPos.clone();
   let hasPrev = false;
-  let segCount = 0;
+
+  const disposeHullObjects = () => {
+    if (hullMesh) {
+      group.remove(hullMesh);
+      hullMesh.geometry.dispose();
+      hullMesh = null;
+    }
+    if (hullEdges) {
+      group.remove(hullEdges);
+      hullEdges.geometry.dispose();
+      hullEdges = null;
+    }
+  };
+
+  const rebuild = () => {
+    const candidates = hullVerts.concat(pending);
+    if (candidates.length < 4) return;
+    let geo: BufferGeometry;
+    try {
+      geo = new ConvexGeometry(candidates);
+    } catch {
+      // 点群がほぼ同一平面上などで凸包を作れない場合は次の追加点を待つ
+      return;
+    }
+    disposeHullObjects();
+    hullMesh = new Mesh(geo, fillMat);
+    hullEdges = new LineSegments(new EdgesGeometry(geo, 1), edgeMat);
+    group.add(hullMesh);
+    group.add(hullEdges);
+    hullVerts = extractHullVertices(geo);
+    pending = [];
+  };
 
   const append = (pos: Vector3) => {
     if (!hasPrev) {
@@ -415,38 +439,28 @@ function createPersistentTrail(initPos: Vector3, color: Color): PersistentTrail 
       hasPrev = true;
       return;
     }
-    if (segCount >= cap) return; // 上限で凍結
-    // 前回とほぼ同じ位置なら省略（同じ点連続の無駄書き込みを減らす）
     const dx = pos.x - prev.x;
     const dy = pos.y - prev.y;
     const dz = pos.z - prev.z;
-    if (dx * dx + dy * dy + dz * dz < 1e-8) return;
-    const s = 6 * segCount;
-    posBuf[s + 0] = prev.x;
-    posBuf[s + 1] = prev.y;
-    posBuf[s + 2] = prev.z;
-    posBuf[s + 3] = pos.x;
-    posBuf[s + 4] = pos.y;
-    posBuf[s + 5] = pos.z;
-    // 色は初期化済みなので touch 不要
+    if (dx * dx + dy * dy + dz * dz < NPRIME_HULL_DEDUP_DIST2) return;
     prev.copy(pos);
-    segCount++;
-    geo.instanceCount = segCount;
-    posBufWrap.needsUpdate = true;
+    pending.push(pos.clone());
+    if (pending.length >= NPRIME_HULL_REBUILD_EVERY) rebuild();
   };
 
   const reset = (pos: Vector3) => {
-    segCount = 0;
+    disposeHullObjects();
+    hullVerts = [];
+    pending = [];
     hasPrev = false;
     prev.copy(pos);
-    geo.instanceCount = 0;
   };
 
   const setVisible = (v: boolean) => {
-    line.visible = v;
+    group.visible = v;
   };
 
-  return { line, append, reset, setVisible };
+  return { root: group, append, reset, setVisible };
 }
 
 const nprimePersistent: PersistentTrail = createPersistentTrail(
